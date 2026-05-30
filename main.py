@@ -1,11 +1,13 @@
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 
 import uvicorn
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from a2a.server.agent_execution.agent_executor import AgentExecutor
 from a2a.server.agent_execution.context import RequestContext
@@ -30,6 +32,8 @@ from a2a.types import (
     TaskStatus
 )
 
+from a2a import types as a2atypes 
+from src import database, types
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +66,21 @@ class SampleAgentExecutor(AgentExecutor):
         user_message = context.message
         task_id = context.task_id
         context_id = context.context_id
-        
+
         if not user_message or not task_id or not context_id:
             return
+
+        thread = database.get_thread(context_id)
+        if thread is None:
+            thread = types.Thread(id=context_id, name=context_id)
+            database.add_thread(thread)
+
+        # Create a new message
+        database.add_message(
+            types.Message.from_a2a_message(user_message)
+        )
+        
+        messages = database.get_messages(by_thread_id=context_id)
 
         self.running_tasks.add(task_id)
 
@@ -80,7 +96,7 @@ class SampleAgentExecutor(AgentExecutor):
                 id=task_id,
                 context_id=context_id,
                 status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
-                history=[user_message],
+                history=[m.to_a2a_message() for m in messages],
             )
         )
 
@@ -90,8 +106,9 @@ class SampleAgentExecutor(AgentExecutor):
             context_id=context_id,
         )
 
-        working_message = updater.new_agent_message(
-            parts=[Part(text='Processing your question...')]
+        working_message = self._new_agent_message(
+            parts=[Part(text='Processing your question...')],
+            updater=updater
         )
         await updater.start_work(message=working_message)
 
@@ -103,12 +120,36 @@ class SampleAgentExecutor(AgentExecutor):
         if task_id not in self.running_tasks:
             return
 
-        await updater.add_artifact(
+        
+
+        if "help" in query.strip().lower():
+            agm_message = self._new_agent_message(
+                parts=[Part(text="What can i help u wid?")],
+                updater=updater
+            )
+            await updater.requires_input(message=agm_message)
+            return
+        
+        if "tool" in query.strip().lower():
+            agm_message = self._new_agent_message(
+                parts=[Part(text=json.dumps({"tool_name": "my_tool", "tool_args": {"arg1": "value1"}}))],
+                updater=updater
+            )
+            await updater.requires_input(message=agm_message)
+            return
+
+        agm_message = self._new_agent_message(
             parts=[Part(text=agent_reply_text)],
+            updater=updater
+        )
+        await updater.add_artifact(
+            parts=agm_message.parts,
             name='response',
             last_chunk=True,
         )
         await updater.complete()
+
+        database.log_database_state()
 
         logger.info(
             '[SampleAgentExecutor] Task %s finished with state: completed',
@@ -129,6 +170,15 @@ class SampleAgentExecutor(AgentExecutor):
         if 'goodbye' in ql or 'bye' in ql:
             return 'Goodbye! Have a wonderful day!'
         return f"Hello World! You said: '{query}'. Thanks for your message!"
+
+    def _new_agent_message(self, parts: list[Part], updater:TaskUpdater)-> a2atypes.Message:
+        working_message = updater.new_agent_message(
+            parts=parts
+        )
+        m = types.Message.from_a2a_message(working_message)
+        database.add_message(m)
+
+        return working_message
 
 
 async def serve(
@@ -203,9 +253,21 @@ async def serve(
     agent_card_routes = create_agent_card_routes(
         agent_card=agent_card,
     )
+    agent_card_alias_routes = create_agent_card_routes(
+        agent_card=agent_card,
+        card_url='/.well-known/agent.json',
+    )
     app = FastAPI()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=['*'],
+        allow_credentials=True,
+        allow_methods=['*'],
+        allow_headers=['*'],
+    )
     app.routes.extend(jsonrpc_routes)
     app.routes.extend(agent_card_routes)
+    app.routes.extend(agent_card_alias_routes)
     app.routes.extend(rest_routes)
 
 
