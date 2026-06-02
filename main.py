@@ -32,6 +32,8 @@ from a2a.types import (
     TaskStatus
 )
 
+from google.protobuf import json_format
+from google.protobuf.struct_pb2 import Value
 from a2a import types as a2atypes 
 from src import database, types
 
@@ -132,7 +134,7 @@ class SampleAgentExecutor(AgentExecutor):
         
         if "tool" in query.strip().lower():
             agm_message = self._new_agent_message(
-                parts=[Part(text=json.dumps({"tool_name": "my_tool", "tool_args": {"arg1": "value1"}}))],
+                parts=[Part(data=json_format.ParseDict({"tool_name": "my_tool", "tool_args": {"arg1": "value1"}}, Value()))],
                 updater=updater
             )
             await updater.requires_input(message=agm_message)
