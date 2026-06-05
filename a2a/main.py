@@ -19,6 +19,7 @@ from a2a.server.routes import (
     create_rest_routes,
 )
 from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+from a2a.server.tasks.database_task_store import DatabaseTaskStore
 from a2a.server.tasks.task_updater import TaskUpdater
 from a2a.types import (
     AgentCapabilities,
@@ -134,10 +135,18 @@ class SampleAgentExecutor(AgentExecutor):
         
         if "tool" in query.strip().lower():
             agm_message = self._new_agent_message(
-                parts=[Part(data=json_format.ParseDict({"tool_name": "my_tool", "tool_args": {"arg1": "value1"}}, Value()))],
+                parts=[Part(data=json_format.ParseDict({"data": { "exec-id":"a", "tool-id": "toolxxx", "parameters": "name: yoo" },
+        "kind": "tool-call-request"}, Value()))],
                 updater=updater
             )
-            await updater.requires_input(message=agm_message)
+            await updater.update_status(state=TaskState.TASK_STATE_WORKING, message=agm_message)
+            await asyncio.sleep(2)
+            agm_message = self._new_agent_message(
+                parts=[Part(data=json_format.ParseDict({"data": { "exec-id":"a", "tool-id": "toolxxx", "response": "name was yoo" },
+        "kind": "tool-call-response"}, Value()))],
+                updater=updater
+            )
+            await updater.update_status(state=TaskState.TASK_STATE_WORKING, message=agm_message)
             return
 
         agm_message = self._new_agent_message(
