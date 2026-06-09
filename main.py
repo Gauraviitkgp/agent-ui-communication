@@ -1,14 +1,12 @@
 import argparse
 import asyncio
 import contextlib
+from datetime import UTC, datetime
 import json
 import logging
+import os
 
 import uvicorn
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
 from a2a.server.agent_execution.agent_executor import AgentExecutor
 from a2a.server.agent_execution.context import RequestContext
 from a2a.server.events.event_queue import EventQueue
@@ -18,7 +16,8 @@ from a2a.server.routes import (
     create_jsonrpc_routes,
     create_rest_routes,
 )
-from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+from a2a.server.routes.agent_card_routes import agent_card_to_dict
+from a2a.server.tasks.database_task_store import DatabaseTaskStore
 from a2a.server.tasks.task_updater import TaskUpdater
 from a2a.types import (
     AgentCapabilities,
@@ -29,186 +28,171 @@ from a2a.types import (
     Part,
     Task,
     TaskState,
-    TaskStatus
+    TaskStatus,
 )
-
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from google.protobuf import json_format
 from google.protobuf.struct_pb2 import Value
-from a2a import types as a2atypes 
-from src import database, types
+from sqlalchemy.ext.asyncio import create_async_engine
 
 logger = logging.getLogger(__name__)
 
 
-class SampleAgentExecutor(AgentExecutor):
-    """Sample agent executor logic similar to the a2a-js sample."""
-
-    def __init__(self) -> None:
-        self.running_tasks: set[str] = set()
+class RepoTaskAgentExecutor(AgentExecutor):
+    """Receives repo/auth payloads and stores them as A2A task artifacts."""
 
     async def cancel(
         self, context: RequestContext, event_queue: EventQueue
     ) -> None:
-        """Cancels a task."""
-        task_id = context.task_id
-        if task_id in self.running_tasks:
-            self.running_tasks.remove(task_id)
-
         updater = TaskUpdater(
             event_queue=event_queue,
-            task_id=task_id or '',
+            task_id=context.task_id or '',
             context_id=context.context_id or '',
         )
         await updater.cancel()
-
     async def execute(
         self, context: RequestContext, event_queue: EventQueue
     ) -> None:
-        """Executes a task inline."""
-        user_message = context.message
         task_id = context.task_id
         context_id = context.context_id
-
-        if not user_message or not task_id or not context_id:
+        # The user message is the input provided by the user that triggered this execution.
+        # It is extracted from the request context and can be used for logging, debugging, or as part of the task processing logic.
+        user_message = context.message
+        if not task_id or not context_id or not user_message:
             return
-
-        thread = database.get_thread(context_id)
-        if thread is None:
-            thread = types.Thread(id=context_id, name=context_id)
-            database.add_thread(thread)
-
-        # Create a new message
-        database.add_message(
-            types.Message.from_a2a_message(user_message)
-        )
-        
-        messages = database.get_messages(by_thread_id=context_id)
-
-        self.running_tasks.add(task_id)
-
-        logger.info(
-            '[SampleAgentExecutor] Processing message %s for task %s (context: %s)',
-            user_message.message_id,
-            task_id,
-            context_id,
-        )
-
-        await event_queue.enqueue_event(
-            Task(
-                id=task_id,
-                context_id=context_id,
-                status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
-                history=[m.to_a2a_message() for m in messages],
-            )
-        )
 
         updater = TaskUpdater(
             event_queue=event_queue,
             task_id=task_id,
             context_id=context_id,
         )
-
-        working_message = self._new_agent_message(
-            parts=[Part(text='Processing your question...')],
-            updater=updater
-        )
-        await updater.start_work(message=working_message)
-
-        query = context.get_user_input()
-
-        agent_reply_text = self._parse_input(query)
-        await asyncio.sleep(1)
-
-        if task_id not in self.running_tasks:
-            return
-
-        
-
-        if "help" in query.strip().lower():
-            agm_message = self._new_agent_message(
-                parts=[Part(text="What can i help u wid?")],
-                updater=updater
+        await event_queue.enqueue_event(
+            Task(
+                id=task_id,
+                context_id=context_id,
+                status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
+                history=[user_message],
             )
-            await updater.requires_input(message=agm_message)
-            return
-        
-        if "tool" in query.strip().lower():
-            agm_message = self._new_agent_message(
-                parts=[Part(data=json_format.ParseDict({"tool_name": "my_tool", "tool_args": {"arg1": "value1"}}, Value()))],
-                updater=updater
-            )
-            await updater.requires_input(message=agm_message)
-            return
-
-        agm_message = self._new_agent_message(
-            parts=[Part(text=agent_reply_text)],
-            updater=updater
         )
+        await updater.start_work(
+            message=updater.new_agent_message(
+                parts=[Part(text='Creating repository task artifact...')]
+            )
+        )
+
+        repo_task = self._parse_repo_task_payload(context.get_user_input())
+        if repo_task is None:
+            # If the input is not valid JSON or doesn't contain the expected fields, mark the task as failed and provide an error message.
+            # The expected input format is a JSON object with the following structure:
+            # {
+            #   "kind": "repository-task",
+            #   "repoUrl": "https://github.com/user/repo",
+            #   "authId": "your-auth-id"
+            # }
+            await updater.failed(
+                message=updater.new_agent_message(
+                    parts=[
+                        Part(
+                            text=(
+                                'Expected JSON: {"kind":"repository-task",'
+                                '"repoUrl":"...","authId":"..."}'
+                            )
+                        )
+                    ]
+                )
+            )
+            return
+        # If the input is valid, construct an artifact containing the repository task information and add it to the task. 
+        # This artifact will be stored in the task store (e.g., MySQL if MYSQL_URL is set) and can be accessed later for processing or reference.
+        artifact_data = {
+            'kind': 'repository-task',
+            'taskId': task_id,
+            'contextId': context_id,
+            'repoUrl': repo_task['repoUrl'],
+            'authId': repo_task['authId'],
+            'state': 'stored',
+            'createdAt': datetime.now(UTC).isoformat(),
+        }
+
+        # This is the important line: DatabaseTaskStore persists the Task, and
+        # the Task includes this artifact. With MYSQL_URL set to a MySQL DSN,
+        # the artifact lands in the MySQL-backed task store.
         await updater.add_artifact(
-            parts=agm_message.parts,
-            name='response',
+            parts=[
+                Part(data=json_format.ParseDict(artifact_data, Value())),
+            ],
+            name='repository-task',
             last_chunk=True,
         )
-        await updater.complete()
-
-        database.log_database_state()
-
-        logger.info(
-            '[SampleAgentExecutor] Task %s finished with state: completed',
-            task_id,
-        )
-
-    def _parse_input(self, query: str) -> str:
-        if not query:
-            return 'Hello! Please provide a message for me to respond to.'
-
-        ql = query.lower()
-        if 'hello' in ql or 'hi' in ql:
-            return 'Hello World! Nice to meet you!'
-        if 'how are you' in ql:
-            return (
-                "I'm doing great! Thanks for asking. How can I help you today?"
+        # storing in artifact is same as storing in mysql ?
+        # Storing in an artifact means that the repository task information is added as an artifact to the A2A task. 
+        # The A2A framework will then handle the persistence of this artifact according to the configured task store. 
+        # If the task store is backed by MySQL (as indicated by the MYSQL_URL environment variable),
+        #  then the artifact will be stored in the MySQL database. So, while you are adding an artifact to the task, 
+        # the underlying storage mechanism (MySQL in this case) is responsible for actually saving that artifact data in a persistent way.
+        # where is my sql database ? how do i see the stored artifact in mysql ?
+        # The MySQL database is specified by the MYSQL_URL environment variable. If you have set it to something like 'mysql+aiomysql://user:password@host:port/database',
+        # then you can connect to that MySQL database using a MySQL client (like MySQL Workbench, phpMyAdmin, or the MySQL command line tool) using the same connection details (user, password, host, port, database).
+        # what will be tyhe schema?
+        # what is the implementation of DatabaseTaskStore?
+        await updater.complete(
+            message=updater.new_agent_message(
+                parts=[
+                    Part(
+                        text=(
+                            'Stored repository task info in artifact '
+                            f'for task {task_id}.'
+                        )
+                    )
+                ]
             )
-        if 'goodbye' in ql or 'bye' in ql:
-            return 'Goodbye! Have a wonderful day!'
-        return f"Hello World! You said: '{query}'. Thanks for your message!"
-
-    def _new_agent_message(self, parts: list[Part], updater:TaskUpdater)-> a2atypes.Message:
-        working_message = updater.new_agent_message(
-            parts=parts
         )
-        m = types.Message.from_a2a_message(working_message)
-        database.add_message(m)
+    def _parse_repo_task_payload(self, raw: str) -> dict[str, str] | None:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
 
-        return working_message
+        if not isinstance(payload, dict):
+            return None
+        if payload.get('kind') != 'repository-task':
+            return None
+
+        repo_url = str(payload.get('repoUrl') or '').strip()
+        auth_id = str(payload.get('authId') or '').strip()
+        if not repo_url or not auth_id:
+            return None
+
+        return {'repoUrl': repo_url, 'authId': auth_id}
 
 
-async def serve(
-    host: str = '127.0.0.1',
-    port: int = 41241,
-) -> None:
-    """Run the Sample Agent server with mounted JSON-RPC, HTTP+JSON and gRPC transports."""
-    agent_card = AgentCard(
-        name='Sample Agent',
-        description='A sample agent to test the stream functionality.',
+def build_agent_card(host: str, port: int) -> AgentCard:
+    return AgentCard(
+        name='Repo Task Artifact Agent',
+        description='Stores repo URL and auth ID as an A2A artifact.',
         provider=AgentProvider(
-            organization='A2A Samples', url='https://example.com'
+            organization='Local Sample',
+            url='http://localhost',
         ),
         version='1.0.0',
         capabilities=AgentCapabilities(
-            streaming=True, push_notifications=False
+            streaming=True,
+            push_notifications=False,
         ),
         default_input_modes=['text'],
-        default_output_modes=['text', 'task-status'],
+        default_output_modes=['text', 'application/json'],
         skills=[
             AgentSkill(
-                id='sample_agent',
-                name='Sample Agent',
-                description='Say hi.',
-                tags=['sample'],
-                examples=['hi'],
+                id='store_repository_task',
+                name='Store repository task',
+                description='Stores repoUrl and authId in the task artifact.',
+                tags=['repo', 'artifact', 'mysql'],
+                examples=[
+                    '{"kind":"repository-task","repoUrl":"https://github.com/org/repo","authId":"github-auth-1"}'
+                ],
                 input_modes=['text'],
-                output_modes=['text', 'task-status'],
+                output_modes=['application/json'],
             )
         ],
         supported_interfaces=[
@@ -235,30 +219,34 @@ async def serve(
         ],
     )
 
-    task_store = InMemoryTaskStore()
+
+async def serve(host: str = '127.0.0.1', port: int = 41241) -> None:
+    agent_card = build_agent_card(host, port)
+
+    database_url = os.getenv(
+        'MYSQL_URL',
+        'sqlite+aiosqlite:///tasks.db',
+    )
+    engine = create_async_engine(database_url, echo=False)
+    # DatabaseTaskStore uses SQLAlchemy to persist tasks and their artifacts. 
+    # By configuring it with a MySQL database URL, you enable the A2A framework to store task information in MySQL. 
+    # This allows you to query and manage tasks and their associated artifacts using MySQL tools and interfaces.
+    task_store = DatabaseTaskStore(engine=engine)
+    await task_store.initialize()
+    
+    # The DefaultRequestHandler is responsible for handling incoming requests to the A2A agent. 
+    # By passing an instance of RepoTaskAgentExecutor, you are specifying that this handler should
+    # use the logic defined in RepoTaskAgentExecutor to process incoming requests.
+    # The logic in RepoTaskAgentExecutor is responsible for handling the specific tasks related to repository tasks,
+    # such as storing the repo URL and auth ID as artifacts in the task store.
+    # intutive way to understand this is that when a request comes in to the A2A agent (e.g., a JSON-RPC call or an HTTP request),
+    # the DefaultRequestHandler will delegate the processing of that request to the RepoTaskAgentExecutor, which contains the specific logic for handling repository tasks.
     request_handler = DefaultRequestHandler(
-        agent_executor=SampleAgentExecutor(),
+        agent_executor=RepoTaskAgentExecutor(),
         task_store=task_store,
         agent_card=agent_card,
     )
 
-    rest_routes = create_rest_routes(
-        request_handler=request_handler,
-        path_prefix='/a2a/rest',
-        enable_v0_3_compat=True,
-    )
-    jsonrpc_routes = create_jsonrpc_routes(
-        request_handler=request_handler,
-        rpc_url='/a2a/jsonrpc',
-        enable_v0_3_compat=True,
-    )
-    agent_card_routes = create_agent_card_routes(
-        agent_card=agent_card,
-    )
-    agent_card_alias_routes = create_agent_card_routes(
-        agent_card=agent_card,
-        card_url='/.well-known/agent.json',
-    )
     app = FastAPI()
     app.add_middleware(
         CORSMiddleware,
@@ -267,39 +255,47 @@ async def serve(
         allow_methods=['*'],
         allow_headers=['*'],
     )
-    app.routes.extend(jsonrpc_routes)
-    app.routes.extend(agent_card_routes)
-    app.routes.extend(agent_card_alias_routes)
-    app.routes.extend(rest_routes)
 
+    @app.get('/.well-known/agent.json')
+    async def get_agent_json() -> dict:
+        return agent_card_to_dict(agent_card)
 
-   
-    config = uvicorn.Config(app, host=host, port=port)
-    uvicorn_server = uvicorn.Server(config)
+    @app.get('/.well-known/agent-card.json')
+    async def get_agent_card_json() -> dict:
+        return agent_card_to_dict(agent_card)
 
-    logger.info('Starting Sample Agent servers:')
-    logger.info(' - HTTP on http://%s:%s', host, port)
-    logger.info(
-        'Agent Card available at http://%s:%s/.well-known/agent-card.json',
-        host,
-        port,
+    app.router.routes.extend(
+        create_jsonrpc_routes(
+            request_handler=request_handler,
+            rpc_url='/a2a/jsonrpc',
+            enable_v0_3_compat=True,
+        )
+    )
+    app.router.routes.extend(
+        create_rest_routes(
+            request_handler=request_handler,
+            path_prefix='/a2a/rest',
+            enable_v0_3_compat=True,
+        )
+    )
+    app.router.routes.extend(create_agent_card_routes(agent_card=agent_card))
+    app.router.routes.extend(
+        create_agent_card_routes(
+            agent_card=agent_card,
+            card_url='/.well-known/agent.json',
+        )
     )
 
-    await asyncio.gather(
-        uvicorn_server.serve(),
-    )
+    logger.info('Using task store database: %s', database_url)
+    logger.info('Agent card: http://%s:%s/.well-known/agent.json', host, port)
+    await uvicorn.Server(uvicorn.Config(app, host=host, port=port)).serve()
 
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    parser = argparse.ArgumentParser(description='Sample A2A agent server')
+    parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=41241)
     args = parser.parse_args()
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(
-            serve(
-                host=args.host,
-                port=args.port,
-            )
-        )
+        asyncio.run(serve(host=args.host, port=args.port))

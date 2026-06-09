@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "a2a-sdk[all]>=1.0.3",
+    "asyncmy>=0.2.10",
     "fastapi>=0.136.3",
     "pandas>=3.0.3",
     "uvicorn>=0.48.0",
